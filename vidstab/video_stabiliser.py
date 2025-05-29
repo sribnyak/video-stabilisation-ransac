@@ -3,7 +3,6 @@ import warnings
 import cv2
 import numpy as np
 from tqdm.auto import trange
-from scipy.optimize import least_squares
 
 from .video import Video
 
@@ -21,84 +20,6 @@ def pts_to_3d_array(pts_list: list) -> np.ndarray:
     return np.array(pts_list, dtype=np.float32).reshape(-1, 1, 2)
 
 
-def find_homography_ransac(
-    src_pts: np.ndarray,
-    dst_pts: np.ndarray,
-    threshold: float = 0.5,
-    max_iters: int = 2000,
-    confidence: float = 0.95,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Find homography matrix using RANSAC.
-
-    Args:
-        src_pts (np.ndarray): points in the source image.
-        dst_pts (np.ndarray): points in the destination image.
-        threshold (float, optional): threshold between inliers and outliers.
-            Defaults to 0.5.
-        max_iters (int, optional): maximum iterations of random sampling and
-            calculating homography. Defaults to 2000.
-        confidence (float, optional): the fraction of points to be identified
-            as inliers for the algorithm to stop early. Defaults to 0.95.
-
-    Returns:
-        tuple[np.ndarray, np.ndarray]: the homography matrix and the mask of
-            inliers.
-    """
-    num_pts = len(src_pts)
-
-    best_H = np.zeros((3, 3))
-    best_mask = np.zeros(num_pts)
-    most_inliers = 0
-    for iter_idx in range(max_iters):
-        sample = np.random.choice(len(src_pts), 4, replace=False)
-        H = cv2.getPerspectiveTransform(src_pts[sample], dst_pts[sample])
-
-        transformed_pts = cv2.perspectiveTransform(src_pts, H)
-        error = np.sum((transformed_pts - dst_pts) ** 2, axis=-1)
-        mask = error < threshold**2
-
-        inliers = np.sum(mask)
-        if inliers > most_inliers:
-            best_H = H
-            best_mask = mask
-            most_inliers = inliers
-
-        if inliers >= confidence * num_pts:
-            break
-
-    return best_H, best_mask.astype(np.uint8)
-
-
-def camera_rotation_quality(
-    angles_rad: np.ndarray,
-    src_pts: np.ndarray,
-    dst_pts: np.ndarray,
-    K: np.ndarray,
-    K_inv: np.ndarray,
-) -> np.ndarray:
-    """Cost function for optimization. Returns an array of residuals."""
-    R = rotation_matrix(angles_rad)
-    H = K @ R @ K_inv
-    projected = cv2.perspectiveTransform(src_pts, H)
-    return (projected - dst_pts).ravel()
-
-
-def rotation_matrix(angles_rad: np.ndarray) -> np.ndarray:
-    """Create rotation matrix from Euler angles (Z-Y-X convention)."""
-    rx, ry, rz = angles_rad
-
-    Rx = np.array(
-        [[1, 0, 0], [0, np.cos(rx), -np.sin(rx)], [0, np.sin(rx), np.cos(rx)]]
-    )
-    Ry = np.array(
-        [[np.cos(ry), 0, np.sin(ry)], [0, 1, 0], [-np.sin(ry), 0, np.cos(ry)]]
-    )
-    Rz = np.array(
-        [[np.cos(rz), -np.sin(rz), 0], [np.sin(rz), np.cos(rz), 0], [0, 0, 1]]
-    )
-    return Rz @ Ry @ Rx
-
-
 class VideoStabiliser:
     """Class for video stabilisation."""
 
@@ -106,7 +27,6 @@ class VideoStabiliser:
         self,
         max_matches: int = 100,
         ransac_threshold: float = 0.5,
-        find_angles: bool = True,
         focal_length: float = 705.0,
         verbose: bool = False,
     ):
@@ -117,19 +37,11 @@ class VideoStabiliser:
                 keypoints to use for aligning frames. Defaults to 100.
             ransac_threshold (float, optional): the threshold argument
                 for RANSAC. Defaults to 0.5.
-            find_angles (bool, optional): if True, finds angles and calculates
-                the alignment from those. In this case the focal length must be
-                provided. After finding the angles, an average rotation is
-                calculated and the frames are transformed relative to it.
-                If false, finds general homography from 4 points. Average
-                rotation is not calculated and focal_length is not used.
-                Defaults to True.
             focal_length (float, optional): focal length. Defaults to 705.
             verbose (bool, optional): sets verbosity level. Defaults to False.
         """
         self.max_matches = max_matches
         self.ransac_threshold = ransac_threshold
-        self.find_angles = find_angles
         self.focal_length = focal_length
         self.verbose = verbose
 
@@ -144,15 +56,14 @@ class VideoStabiliser:
         Args:
             video (Video): video to stabilise.
         """
-        if self.find_angles:
-            self._K = np.array(
-                [
-                    [self.focal_length, 0, video.w / 2],
-                    [0, self.focal_length, video.h / 2],
-                    [0, 0, 1],
-                ]
-            )
-            self._K_inv = np.linalg.inv(self._K)
+        self._K = np.array(
+            [
+                [self.focal_length, 0, video.w / 2],
+                [0, self.focal_length, video.h / 2],
+                [0, 0, 1],
+            ]
+        )
+        self._K_inv = np.linalg.inv(self._K)
 
         reference_frame_idx = self._choose_reference_frame(video)
         reference_frame = video[reference_frame_idx]
@@ -162,7 +73,7 @@ class VideoStabiliser:
             print("Aligning frames...")
         transforms = []
         self.quality = [1e8] * video.frames_count
-        counter = range if self.verbose and self.find_angles else trange
+        counter = range if self.verbose else trange
         for frame_idx in counter(video.frames_count):
             if frame_idx == reference_frame_idx:
                 transform = np.eye(3)
@@ -172,15 +83,14 @@ class VideoStabiliser:
                 )
             transforms.append(transform)
 
-        if self.find_angles:
-            self.quality[reference_frame_idx] = 0
-            if self.verbose:
-                mean_quality = np.mean(self.quality)
-                print(
-                    "Stabilisation quality (MSE between keypoints): "
-                    + f"{mean_quality:.2f}"
-                )
-            transforms = self._normalize_trajectory(transforms)
+        self.quality[reference_frame_idx] = 0
+        if self.verbose:
+            mean_quality = np.mean(self.quality)
+            print(
+                "Stabilisation quality (MSE between keypoints): "
+                + f"{mean_quality:.2f}"
+            )
+        # transforms = self._normalize_trajectory(transforms)  # TODO
 
         if self.verbose:
             print("Applying transforms...")
@@ -226,20 +136,63 @@ class VideoStabiliser:
         matches = self._bf_matcher.match(des_query, des_train)
         return sorted(matches, key=lambda x: x.distance)[: self.max_matches]
 
-    def _angles_to_homography(self, angles_rad: np.ndarray) -> np.ndarray:
-        R = rotation_matrix(angles_rad)
+    def _find_rotation_svd(
+        self, src_pts: np.ndarray, dst_pts: np.ndarray
+    ) -> np.ndarray:
+        src_mat = src_pts.reshape(-1, 2).T
+        dst_mat = dst_pts.reshape(-1, 2).T
+
+        ones = np.ones((1, src_pts.shape[0]))
+        src_mat = self._K_inv @ np.vstack([src_mat, ones])
+        dst_mat = self._K_inv @ np.vstack([dst_mat, ones.copy()])
+
+        src_mat /= np.linalg.norm(src_mat, axis=0, keepdims=True)
+        dst_mat /= np.linalg.norm(dst_mat, axis=0, keepdims=True)
+        u, s, vh = np.linalg.svd(src_mat @ dst_mat.T)
+        R = vh.T @ u.T
+        if np.linalg.det(R) < 0:
+            vh[2] *= -1
+            R = vh.T @ u.T
+        # TODO angles
         return self._K @ R @ self._K_inv
 
-    def _find_camera_rotation(
-        self, src_pts: np.ndarray, dst_pts: np.ndarray
-    ) -> tuple[np.ndarray, bool]:
-        initial_angles = np.zeros(3)
-        result = least_squares(
-            fun=camera_rotation_quality,
-            x0=initial_angles,
-            args=(src_pts, dst_pts, self._K, self._K_inv),
-        )
-        return result.x, result.success
+    def _find_camera_rotation_ransac(
+        self,
+        src_pts: np.ndarray,
+        dst_pts: np.ndarray,
+        threshold: float = 0.5,
+        max_iters: int = 2000,
+        confidence: float = 0.95,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        num_pts = len(src_pts)
+
+        best_rot = np.eye(3)
+        best_mask = np.zeros(num_pts)
+        most_inliers = 0
+        for iter_idx in range(max_iters):
+            sample = np.random.choice(len(src_pts), 3, replace=False)
+            rotation = self._find_rotation_svd(
+                src_pts[sample], dst_pts[sample]
+            )
+
+            transformed_pts = cv2.perspectiveTransform(src_pts, rotation)
+
+            error = np.sum((transformed_pts - dst_pts) ** 2, axis=-1)
+            mask = error < threshold**2
+
+            inliers = np.sum(mask)
+            if inliers > most_inliers:
+                best_rot = rotation
+                best_mask = mask
+                most_inliers = inliers
+
+            if inliers >= confidence * num_pts:
+                break
+
+        if self.verbose:
+            print("Best inliers:", most_inliers)
+
+        return best_rot, best_mask
 
     def _align_frames(
         self, reference_frame_data, cur_frame: np.ndarray, frame_idx: int
@@ -255,60 +208,17 @@ class VideoStabiliser:
             return np.eye(3)
         pts_ref = pts_to_3d_array([kp_ref[m.queryIdx].pt for m in matches])
         pts_cur = pts_to_3d_array([kp_cur[m.trainIdx].pt for m in matches])
-        H, mask = find_homography_ransac(
+        H, inlier_mask = self._find_camera_rotation_ransac(
             pts_cur, pts_ref, self.ransac_threshold
         )
-        if not self.find_angles:
-            return H
 
-        inlier_mask = mask.ravel() == 1
-        inliers_ref = pts_ref[inlier_mask]
-        inliers_cur = pts_cur[inlier_mask]
-        angles_rad, success = self._find_camera_rotation(
-            inliers_cur, inliers_ref
-        )
-        if not success:
-            warnings.warn(
-                f"Optimization failed for frame {frame_idx}. "
-                + "Using transform found by RANSAC"
-            )
-            return H
-
-        quality = np.mean(
-            camera_rotation_quality(
-                angles_rad, inliers_cur, inliers_ref, self._K, self._K_inv
-            )
-            ** 2
-        )
+        inliers_ref = pts_ref[inlier_mask].reshape(-1, 1, 2)
+        inliers_cur = pts_cur[inlier_mask].reshape(-1, 1, 2)
+        projected = cv2.perspectiveTransform(inliers_cur, H)
+        quality = np.mean((projected - inliers_ref).ravel() ** 2)
         self.quality[frame_idx] = quality
 
         if self.verbose:
-            rx, ry, rz = [float(angle) / np.pi * 180 for angle in angles_rad]
-            print(
-                f"Frame {frame_idx}: rx={rx:.4f}, ry={ry:.4f}, rz={rz:.4f}, "
-                + f"quality={quality:.2f}"
-            )
-        return angles_rad
-
-    def _normalize_trajectory(
-        self, transforms: list[np.ndarray]
-    ) -> list[np.ndarray]:
-        normalized_transforms = []
-        rotations = []
-        for t in transforms:
-            if t.ndim == 1:
-                normalized_transforms.append(self._angles_to_homography(t))
-                rotations.append(t)
-            else:
-                normalized_transforms.append(t)
-
-        if len(rotations) < len(transforms) // 2:
-            return normalized_transforms
-        average_rotation = np.mean(np.array(rotations), axis=0)
-        if self.verbose:
-            rx, ry, rz = [
-                float(angle) / np.pi * 180 for angle in average_rotation
-            ]
-            print(f"Average rotation: rx={rx:.4f}, ry={ry:.4f},  rz={rz:.4f}")
-        avg_H = self._angles_to_homography(average_rotation)
-        return [np.linalg.inv(avg_H) @ H for H in normalized_transforms]
+            # rx, ry, rz = [float(angle) / np.pi * 180 for angle in angles_rad]
+            print(f"Frame {frame_idx}: quality={quality:.2f}")
+        return H
